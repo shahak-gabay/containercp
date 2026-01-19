@@ -1,205 +1,302 @@
-﻿/* Copyright 2023 Hewlett Packard Enterprise Development LP.
+/* Copyright 2023 Hewlett Packard Enterprise Development LP.
  * 
  * You can redistribute this program and/or modify it under the terms of
  * the GNU Lesser Public License version 2.1
  */
-using BoltDB;
-using ContainerdLibrary;
+using containercp;
+using System;
 using System.Collections.Generic;
 using System.IO;
+using System.Text;
 
-namespace containercp
+namespace ContainerdLibrary
 {
-    internal class ContainerdDatabaseHelper
+    public class ContainerdDatastoreHelper
     {
-        private const string V1BucketName = "v1";
-        private const string KubernetesIoBucketName = "k8s.io";
-        private const string ContainersBucketName = "containers";
-        private const string ImagesBucketName = "images";
-        private const string SnapshotsBucketName = "snapshots";
-        private const string OverlayFSBucketName = "overlayfs";
+        private const string DefaultContainerdDirectoryPath = "/var/snap/microk8s/common/var/lib/containerd";
+        private const string BlobsRelativePath = "io.containerd.content.v1.content/blobs";
+        private const string DatabaseRelativePath = "io.containerd.metadata.v1.bolt/meta.db";
+        private const string SnapshotDatabaseRelativePath = "io.containerd.snapshotter.v1.overlayfs/metadata.db";
+        private const string SnapshotsDirectoryRelativePath = "io.containerd.snapshotter.v1.overlayfs/snapshots";
+        private const string Sha256HashType = "sha256";
 
-        private const string LabelsBucketName = "labels";
-        private const string ContainerNameKey = "io.kubernetes.container.name";
-        private const string PodNameKey = "io.kubernetes.pod.name";
-        private const string PodNamespaceKey = "io.kubernetes.pod.namespace";
-        private const string ContainerImageKey = "image";
+        private string m_containerdDirectoryPath;
+        private ContainerdDatabaseHelper m_databaseHelper;
+        private SnapshotDatabaseHelper m_snapshotDatabaseHelper;
 
-        private string m_databasePath;
-
-        public ContainerdDatabaseHelper(string databasePath)
+        public ContainerdDatastoreHelper() : this(DefaultContainerdDirectoryPath)
         {
-            m_databasePath = databasePath;
+        }
+
+        public ContainerdDatastoreHelper(string containerdDirectoryPath)
+        {
+            m_containerdDirectoryPath = containerdDirectoryPath;
+            string databasePath = Path.Combine(containerdDirectoryPath, DatabaseRelativePath);
+            m_databaseHelper = new ContainerdDatabaseHelper(databasePath);
+            string snapshotDatabasePath = Path.Combine(containerdDirectoryPath, SnapshotDatabaseRelativePath);
+            m_snapshotDatabaseHelper = new SnapshotDatabaseHelper(snapshotDatabasePath);
         }
 
         public bool IsDatabaseExists()
         {
-            return File.Exists(m_databasePath);
+            return m_databaseHelper.IsDatabaseExists();
         }
 
-        public ContainerDetails GetContainerDetailsByContainerID(string containerID)
+        public string GetBlobPath(BlobReference reference)
         {
-            List<ContainerDetails> result = new List<ContainerDetails>();
-            BoltDatabase containerdDatabase = BoltDatabaseHelper.Open(m_databasePath);
-            Bucket v1Bucket = containerdDatabase.GetBucket(V1BucketName);
-            Bucket k8sIoBucket = v1Bucket.GetBucket(KubernetesIoBucketName);
-            Bucket containersBucket = k8sIoBucket.GetBucket(ContainersBucketName);
-            Bucket containerBucket = containersBucket.GetBucket(containerID);
-            if (containerBucket == null)
+            return Path.Combine(m_containerdDirectoryPath, BlobsRelativePath, reference.HashType, reference.Hash);
+        }
+
+        public BlobReference GetImageManifestReference(string imageIdentifier)
+        {
+            return m_databaseHelper.GetImageManifestReference(imageIdentifier);
+        }
+
+        public string GetImageManifest(string imageIdentifier, DockerPlatform platform)
+        {
+            BlobReference blobReference = m_databaseHelper.GetImageManifestReference(imageIdentifier);
+            if (blobReference == null)
             {
-                return null;
+                throw new ArgumentException($"Cannot find image manifest for {imageIdentifier}");
             }
 
-            return GetContainerDetails(containerID, containerBucket);
+            string manifestPath = GetBlobPath(blobReference);
+            string manifestText = File.ReadAllText(manifestPath);
+            if (DockerMediaTypeHelper.IsManifestList(blobReference.DockerMediaType))
+            {
+                blobReference = ImageManifestListParser.GetImageManifestReference(manifestText, platform);
+                manifestPath = GetBlobPath(blobReference);
+                manifestText = File.ReadAllText(manifestPath);
+            }
+            return manifestText;
         }
 
-        public List<ContainerDetails> GetContainerDetailsByContainerName(string containerName)
+        public List<BlobReference> GetImageLayers(string imageIdentifier, DockerPlatform platform)
         {
-            List<ContainerDetails> result = new List<ContainerDetails>();
-            BoltDatabase containerdDatabase = BoltDatabaseHelper.Open(m_databasePath);
-            Bucket v1Bucket = containerdDatabase.GetBucket(V1BucketName);
-            Bucket k8sIoBucket = v1Bucket.GetBucket(KubernetesIoBucketName);
-            Bucket containersBucket = k8sIoBucket.GetBucket(ContainersBucketName);
-            foreach(KeyValuePair<string, Bucket> bucketElement in containersBucket.GetBuckets())
+            string imageManifest = GetImageManifest(imageIdentifier, platform);
+            return ImageManifestParser.GetImageLayers(imageManifest);
+        }
+
+        public List<string> GetImageDiffIDs(string imageIdentifier, DockerPlatform platform)
+        {
+            string imageManifest = GetImageManifest(imageIdentifier, platform);
+            BlobReference configReference = ImageManifestParser.GetImageConfigBlobReference(imageManifest);
+            string configPath = GetBlobPath(configReference);
+            string configText = File.ReadAllText(configPath);
+            return ImageConfigParser.GetImageDiffIDs(configText);
+        }
+
+        public List<string> GetImageChainIDs(string imageIdentifier, DockerPlatform platform)
+        {
+            List<string> diffIDs = GetImageDiffIDs(imageIdentifier, platform);
+            List<string> result = new List<string>(diffIDs.Count);
+            if (diffIDs.Count > 0)
             {
-                string containerID = bucketElement.Key;
-                Bucket containerBucket = bucketElement.Value;
-                ContainerDetails containerDetails = GetContainerDetails(containerID, containerBucket);
-                if (containerDetails.ContainerName == containerName)
+                result.Add(diffIDs[0]);
+            }
+
+            for (int index = 1; index < diffIDs.Count; index++)
+            {
+                string previousChainID = result[index - 1];
+                string chainID = CalculateImageChainID(previousChainID, diffIDs[index]);
+                result.Add(chainID);
+            }
+
+            return result;
+        }
+
+        public string GetSnapshotName(string snapshotKey)
+        {
+            return m_databaseHelper.GetSnapshotName(snapshotKey);
+        }
+
+        public List<ContainerDetails> GetAllContainers()
+        {
+            return m_databaseHelper.GetAllContainers();
+        }
+
+        public List<ContainerDetails> GetContainerDetails(string containerName)
+        {
+            return m_databaseHelper.GetContainerDetailsByContainerName(containerName);
+        }
+
+        public List<KeyValuePair<string, BlobReference>> GetAllImages()
+        {
+            return m_databaseHelper.GetAllImages();
+        }
+
+        public bool IsFileExistsInLayer(BlobReference reference, string pathInContainer, out FileMetadata fileMetadata)
+        {
+            string blobPath = GetBlobPath(reference);
+            if (reference.DockerMediaType == DockerMediaType.ImageTarGzip)
+            {
+                return TarHelper.IsFileExistsInTarGzip(blobPath, pathInContainer, out fileMetadata);
+            }
+            else
+            {
+                return TarHelper.IsFileExistsInTar(blobPath, pathInContainer, out fileMetadata);
+            }
+        }
+
+        public List<ContainerDetails> GetContainersUsingLayer(BlobReference reference, DockerPlatform platform)
+        {
+            List<string> images = GetImagesUsingLayer(reference, platform);
+            List<ContainerDetails> containers = m_databaseHelper.GetAllContainers();
+            List<ContainerDetails> result = new List<ContainerDetails>();
+            foreach (ContainerDetails container in containers)
+            {
+                if (images.Contains(container.ImageIdentifier))
                 {
-                    result.Add(containerDetails);
+                    result.Add(container);
                 }
             }
 
             return result;
         }
 
-        public List<ContainerDetails> GetAllContainers()
+        public List<string> GetImagesUsingLayer(BlobReference reference, DockerPlatform platform)
         {
-            List<ContainerDetails> result = new List<ContainerDetails>();
-            BoltDatabase containerdDatabase = BoltDatabaseHelper.Open(m_databasePath);
-            Bucket v1Bucket = containerdDatabase.GetBucket(V1BucketName);
-            Bucket k8sIoBucket = v1Bucket.GetBucket(KubernetesIoBucketName);
-            Bucket containersBucket = k8sIoBucket.GetBucket(ContainersBucketName);
-            foreach (KeyValuePair<string, Bucket> bucketElement in containersBucket.GetBuckets())
+            List<KeyValuePair<string, BlobReference>> images = m_databaseHelper.GetAllImages();
+            List<string> result = new List<string>();
+            foreach (KeyValuePair<string, BlobReference> image in images)
             {
-                string containerID = bucketElement.Key;
-                Bucket containerBucket = bucketElement.Value;
-                ContainerDetails containerDetails = GetContainerDetails(containerID, containerBucket);
-                result.Add(containerDetails);
+                string imageIdentifier = image.Key;
+                string manifest = GetImageManifest(imageIdentifier, platform);
+                List<BlobReference> blobReferences = ImageManifestParser.GetImageLayers(manifest);
+                if (blobReferences.Contains(reference))
+                {
+                    result.Add(imageIdentifier);
+                }
             }
 
             return result;
         }
 
-        public List<KeyValuePair<string, BlobReference>> GetAllImages()
+        public List<string> GetNamedImagesUsingLayer(BlobReference reference, DockerPlatform platform)
         {
-            List<KeyValuePair<string, BlobReference>> result = new List<KeyValuePair<string, BlobReference>>();
-            BoltDatabase containerdDatabase = BoltDatabaseHelper.Open(m_databasePath);
-            Bucket v1Bucket = containerdDatabase.GetBucket(V1BucketName);
-            Bucket k8sIoBucket = v1Bucket.GetBucket(KubernetesIoBucketName);
-            Bucket imagesBucket = k8sIoBucket.GetBucket(ImagesBucketName);
-            foreach (KeyValuePair<string, Bucket> imageBucket in imagesBucket.GetBuckets())
+            List<string> images = GetImagesUsingLayer(reference, platform);
+            List<string> result = new List<string>();
+            foreach(string image in images)
             {
-                string imageIdentifier = imageBucket.Key;
-                BlobReference manifestReference = GetImageManifestBlobReference(imageBucket.Value);
-                
-                result.Add(new KeyValuePair<string, BlobReference>(imageIdentifier, manifestReference));
+                if (!image.StartsWith($"{Sha256HashType}:") && !image.Contains($"@{Sha256HashType}:"))
+                {
+                    result.Add(image);
+                }
             }
+
             return result;
         }
 
-        public BlobReference GetImageManifestReference(string imageIdentifier)
+        public int FindImageLayerIndexContainingFile(List<BlobReference> imageLayers, string pathInImage)
         {
-            BoltDatabase containerdDatabase = BoltDatabaseHelper.Open(m_databasePath);
-            Bucket v1Bucket = containerdDatabase.GetBucket(V1BucketName);
-            Bucket k8sIoBucket = v1Bucket.GetBucket(KubernetesIoBucketName);
-            Bucket imagesBucket = k8sIoBucket.GetBucket(ImagesBucketName);
-            Bucket imageBucket = imagesBucket.GetBucket(imageIdentifier);
-            if (imageBucket == null)
-            {
-                return null;
-            }
-
-            return GetImageManifestBlobReference(imageBucket);
+            return FindImageLayerIndexContainingFile(imageLayers, pathInImage, out _);
         }
 
-        public string GetSnapshotName(string containerSnapshotKey)
+        public int FindImageLayerIndexContainingFile(List<BlobReference> imageLayers, string pathInImage, out FileMetadata fileMetadata)
         {
-            BoltDatabase containerdDatabase = BoltDatabaseHelper.Open(m_databasePath);
-            Bucket v1Bucket = containerdDatabase.GetBucket(V1BucketName);
-            Bucket k8sIoBucket = v1Bucket.GetBucket(KubernetesIoBucketName);
-            Bucket snapshotsBucket = k8sIoBucket.GetBucket(SnapshotsBucketName);
-            Bucket overlayfsBucket = snapshotsBucket.GetBucket(OverlayFSBucketName);
-            Bucket snapshotBucket = overlayfsBucket.GetBucket(containerSnapshotKey);
-            if (snapshotBucket == null)
+            for (int index = imageLayers.Count - 1; index >= 0; index--)
             {
-                return null;
+                BlobReference layerReference = imageLayers[index];
+                if (IsFileExistsInLayer(layerReference, pathInImage, out fileMetadata))
+                {
+                    return index;
+                }
             }
 
-            return snapshotBucket.GetStringValueByKey("name");
+            fileMetadata = null;
+            return -1;
         }
 
-        /// <returns>List of snapshots of layers from lowest to highest</returns>
+        public int FindImageLayerIndexForStoringFile(List<BlobReference> imageLayers, string pathInImage, DockerPlatform platform)
+        {
+            int layerContaningFileIndex = FindImageLayerIndexContainingFile(imageLayers, pathInImage);
+
+            if (layerContaningFileIndex >= 0)
+            {
+                int numberOfImagesUsingLayer = GetNamedImagesUsingLayer(imageLayers[layerContaningFileIndex], platform).Count;
+                if (numberOfImagesUsingLayer == 1)
+                {
+                    return layerContaningFileIndex;
+                }
+            }
+
+            BlobReference topLayerReference = imageLayers[imageLayers.Count - 1];
+            if (GetNamedImagesUsingLayer(topLayerReference, platform).Count == 1)
+            {
+                return imageLayers.Count - 1;
+            }
+
+            return -1;
+        }
+
         public List<string> GetLayersSnapshotNames(string containerSnapshotKey)
         {
-            List<string> result = new List<string>();
-            BoltDatabase containerdDatabase = BoltDatabaseHelper.Open(m_databasePath);
-            Bucket v1Bucket = containerdDatabase.GetBucket(V1BucketName);
-            Bucket k8sIoBucket = v1Bucket.GetBucket(KubernetesIoBucketName);
-            Bucket snapshotsBucket = k8sIoBucket.GetBucket(SnapshotsBucketName);
-            Bucket overlayfsBucket = snapshotsBucket.GetBucket(OverlayFSBucketName);
-            Bucket containerSnapshotBucket = overlayfsBucket.GetBucket(containerSnapshotKey);
-            string parentDigest = containerSnapshotBucket.GetStringValueByKey("parent");
-            while (parentDigest != null)
+            return m_databaseHelper.GetLayersSnapshotNames(containerSnapshotKey);
+        }
+
+        public ulong? GetSnapshotID(string snapshotName)
+        {
+            return m_snapshotDatabaseHelper.GetSnapshotID(snapshotName);
+        }
+
+        public string GetSnapshotPath(string snapshotName)
+        {
+            ulong? snapshotID = m_snapshotDatabaseHelper.GetSnapshotID(snapshotName);
+            if (!snapshotID.HasValue)
             {
-                Bucket parentBucket = overlayfsBucket.GetBucket(parentDigest);
-                string name = parentBucket.GetStringValueByKey("name");
-                result.Add(name);
-                parentDigest = parentBucket.GetStringValueByKey("parent");
+                return null;
+            }
+            return Path.Combine(m_containerdDirectoryPath, SnapshotsDirectoryRelativePath, snapshotID.Value.ToString());
+        }
+
+        public void ExtractFileFromImageLayer(BlobReference layerReference, string pathInImage, string outputPath)
+        {
+            string layerFilePath = GetBlobPath(layerReference);
+            if (layerReference.DockerMediaType == DockerMediaType.ImageTarGzip)
+            {
+                TarHelper.ExtractFileFromTarGzip(layerFilePath, pathInImage, outputPath);
+            }
+            else
+            {
+                TarHelper.ExtractFileFromTar(layerFilePath, pathInImage, outputPath);
+            }
+        }
+
+        public BlobReference PutFileInImageLayer(BlobReference layerReference, string pathInImage, FileStream fileStream, bool overwrite, FileMetadata fileMetadata = null)
+        {
+            string layerFilePath = GetBlobPath(layerReference);
+            // We put the file in the blob directory and not in /tmp to avoid copy time (in case /tmp is mapped to a different partition)
+            string tempOutputPath = Path.Combine(DefaultContainerdDirectoryPath, BlobsRelativePath, "TempFile");
+            if (layerReference.DockerMediaType == DockerMediaType.ImageTarGzip)
+            {
+                TarHelper.PutFileInTarGzipArchive(layerFilePath, pathInImage, fileStream, tempOutputPath, fileMetadata);
+            }
+            else
+            {
+                TarHelper.PutFileInTarArchive(layerFilePath, pathInImage, fileStream, tempOutputPath, fileMetadata);
             }
 
-            result.Reverse();
-
-            return result;
-        }
-
-        private static ContainerDetails GetContainerDetails(string containerID, Bucket containerBucket)
-        {
-            Bucket labelsBucket = containerBucket.GetBucket(LabelsBucketName);
-            string containerName = labelsBucket.GetStringValueByKey(ContainerNameKey);
-            string podName = labelsBucket.GetStringValueByKey(PodNameKey);
-            string podNamespace = labelsBucket.GetStringValueByKey(PodNamespaceKey);
-            string imageIdentifier = containerBucket.GetStringValueByKey(ContainerImageKey);
-            string snapshotterKey = containerBucket.GetStringValueByKey("snapshotKey");
-            return new ContainerDetails(containerID, containerName, imageIdentifier, snapshotterKey, podName, podNamespace);
-        }
-
-        public static uint ToUInt32(byte[] buffer, int offset)
-        {
-            return (uint)((buffer[offset + 0] << 24) | (buffer[offset + 1] << 16)
-                | (buffer[offset + 2] << 8) | (buffer[offset + 3] << 0));
-        }
-
-        public static ulong ToUInt64(byte[] buffer, int offset)
-        {
-            return (((ulong)ToUInt32(buffer, offset + 0)) << 32) | ToUInt32(buffer, offset + 4);
-        }
-
-        private static BlobReference GetImageManifestBlobReference(Bucket imageBucket)
-        {
-            Bucket targetBucket = imageBucket.GetBucket("target");
-            if (targetBucket == null)
+            if (overwrite)
             {
-                throw new InvalidDataException("target bucket is missing");
+                File.Delete(layerFilePath);
+                File.Move(tempOutputPath, layerFilePath);
+                return layerReference;
             }
+            else
+            {
+                string hash = HashCalculator.CalculateSha256HashString(tempOutputPath);
+                string updatedLayerPath = Path.Combine(m_containerdDirectoryPath, BlobsRelativePath, Sha256HashType, hash);
+                File.Move(tempOutputPath, updatedLayerPath);
+                long blobSize = new FileInfo(updatedLayerPath).Length;
 
-            string mediaType = targetBucket.GetStringValueByKey("mediatype");
-            DockerMediaType dockerMediaType = DockerMediaTypeParser.ParseManifestMediaType(mediaType);
-            string digest = targetBucket.GetStringValueByKey("digest");
-            byte[] sizeBytes = (byte[])targetBucket.GetElementValueByKey("size");
-            long size = VarIntConverter.ToInt64(sizeBytes);
-            return new BlobReference(digest, size, dockerMediaType);
+                return new BlobReference(Sha256HashType, hash, blobSize, layerReference.DockerMediaType);
+            }
+        }
+
+        internal static string CalculateImageChainID(string previousChainID, string diffID)
+        {
+            string stringToHash = previousChainID + " " + diffID;
+            return "sha256:" + HashCalculator.CalculateSha256HashString(Encoding.ASCII.GetBytes(stringToHash));
         }
     }
 }
